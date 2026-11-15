@@ -12,6 +12,9 @@
 //   DLC the APK couldn't hold (droidplay-core issue #169) follows the RomFS in that same file, the .romfs or the OBB, as a pack (build_android_from_nsp.py make_game_app
 //   says how it is laid out); game.json gives its offset (dlc_at) and the file's whole size (data_bytes). Its images are copied out once into games/<title ID>/aoc/, where
 //   front_android.c points DM_AOC_DIR as for a launcher install (the host mounts DLC by path), before the game starts; DLC the APK holds is unpacked with the rest.
+//   One-tap installs (Kaoz625 blz/data-download, 15 Nov 2026): when game.json gives "data_url" and none of the above has the data, the app downloads it
+//   by itself into <external files>/<name>.romfs (resumed with HTTP Range after a drop or a restart, free space checked first) and then reads it there like a picked
+//   file. An APK can carry at most ~1.94 GiB, Android's own installer reads no ZIP64, and Play asset delivery needs Google Play, so a big game's data comes this way.
 //   The host ends the process when its activity is destroyed (front_android.c), so every start of the game comes through here again in a fresh process.
 package org.nxnative.android;
 
@@ -53,7 +56,7 @@ import org.json.JSONObject;
 public class GameStart extends Activity {
     static final String ROMFS = "RomFS.img", PREF_URI = "romfs_uri", SPV_ZIP = "spv.zip";
     static final int PICK = 1;
-    String id, name; long romfsBytes, dataBytes, dlcAt; File dir;
+    String id, name, dataUrl; long romfsBytes, dataBytes, dlcAt; File dir, ext;
     TextView status; TextView choose;
 
     @Override protected void onCreate(Bundle b) {
@@ -63,7 +66,8 @@ public class GameStart extends Activity {
         catch (Exception e) { fail("This app holds no game (assets/game/game.json): " + e); return; }
         id = g.optString("title_id").toUpperCase(Locale.ROOT); name = g.optString("name", id); romfsBytes = g.optLong("romfs_bytes", -1);
         dataBytes = g.optLong("data_bytes", romfsBytes); dlcAt = g.optLong("dlc_at", 0);
-        File ext = getExternalFilesDir(null); if (ext == null) ext = getFilesDir();
+        dataUrl = g.optString("data_url", ""); if (dataUrl.isEmpty()) dataUrl = null;
+        ext = getExternalFilesDir(null); if (ext == null) ext = getFilesDir();
         dir = new File(ext, "games/" + id);
         layout();
         new Thread(new Runnable() { public void run() { prepare(); } }, "unpack").start();
@@ -148,6 +152,13 @@ public class GameStart extends Activity {
             }
         } catch (Exception e) { obb = "The game data in the app's OBB folder can't be read: " + e.getMessage(); }
         String u = prefs().getString(PREF_URI, null), why = null;
+        File got = new File(ext, dataName());   // the data this app downloaded itself (data_url)
+        if (got.isFile()) {
+            try { why = open(ParcelFileDescriptor.open(got, ParcelFileDescriptor.MODE_READ_ONLY), "the downloaded game data"); } catch (Exception e) { why = "The downloaded game data can't be opened: " + e.getMessage(); }
+            if (why == null) return;
+            got.delete();   // wrong size or mark (another version): fetch it again below
+        }
+        if (dataUrl != null && u == null) { download(); return; }
         if (u != null) {
             try { why = open(getContentResolver().openFileDescriptor(Uri.parse(u), "r"), "the file you picked"); }
             catch (SecurityException e) { why = "This app may no longer read the game data you picked before."; }
@@ -157,6 +168,52 @@ public class GameStart extends Activity {
         if (why != null || obb != null) say((why != null ? why : obb) + "\n\nPick " + dataName() + " again.");
         else say("Pick " + name + "'s game data: the file " + dataName() + " that came with this app (" + gb(dataBytes) + "). Put it anywhere on this device or its SD card first; the app reads it where it is.");
         choose.setVisibility(View.VISIBLE);
+    }
+
+    // ---------------- the game data from data_url ----------------
+    volatile boolean downloading;
+    void download() {
+        if (downloading) return;
+        downloading = true; choose.setVisibility(View.GONE);
+        getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        new Thread(new Runnable() { public void run() {
+            File part = new File(ext, dataName() + ".part"), done = new File(ext, dataName());
+            String why = null;
+            for (int attempt = 0; attempt < 30; attempt++) {
+                try {
+                    long have = part.length();
+                    if (dataBytes > 0 && ext.getUsableSpace() < dataBytes - have + (200L << 20)) {
+                        why = String.format(Locale.ROOT, "%s needs %s of free space for its game data, and this device has %s free. Free some space, then open the game again.",
+                                name, gb(dataBytes - have + (200L << 20)), gb(ext.getUsableSpace()));
+                        break;
+                    }
+                    if (dataBytes > 0 && have >= dataBytes) break;
+                    java.net.HttpURLConnection c = (java.net.HttpURLConnection) new java.net.URL(dataUrl).openConnection();
+                    c.setConnectTimeout(20000); c.setReadTimeout(60000); c.setInstanceFollowRedirects(true);
+                    if (have > 0) c.setRequestProperty("Range", "bytes=" + have + "-");
+                    int code = c.getResponseCode();
+                    if (code == 200 && have > 0) { have = 0; }                       // the server sent it all again: start over
+                    else if (code != 200 && code != 206) throw new IOException("the server answered " + code);
+                    try (InputStream in = c.getInputStream(); FileOutputStream out = new FileOutputStream(part, have > 0)) {
+                        byte[] buf = new byte[1 << 20]; long t = 0;
+                        for (int k; (k = in.read(buf)) > 0; ) {
+                            out.write(buf, 0, k); have += k;
+                            long now = android.os.SystemClock.uptimeMillis();
+                            if (now - t > 700) { t = now; say(String.format(Locale.ROOT, "Downloading %s's game data (one time): %.2f of %s (%d%%).\nKeep the app open; Wi-Fi is best. A drop resumes where it stopped.",
+                                    name, have / 1e9, gb(dataBytes), dataBytes > 0 ? (int) (have * 100 / dataBytes) : 0)); }
+                        }
+                    } finally { c.disconnect(); }
+                    if (dataBytes <= 0 || part.length() == dataBytes) break;
+                } catch (Exception e) {
+                    why = "The download stopped (" + e.getMessage() + "); trying again…"; say(why);
+                    try { Thread.sleep(Math.min(30000, 2000L << Math.min(attempt, 4))); } catch (InterruptedException ie) { break; }
+                }
+            }
+            downloading = false;
+            if (dataBytes > 0 && part.length() == dataBytes && part.renameTo(done)) { why = null; ui(new Runnable() { public void run() { romfs(); } }); return; }
+            final String msg = (why != null ? why : "The game data didn't download completely.") + "\n\nOpen the game again to resume, or pick " + dataName() + " if you have it.";
+            say(msg); ui(new Runnable() { public void run() { choose.setVisibility(View.VISIBLE); } });
+        } }, "data download").start();
     }
 
     // The game data opened and checked (a RomFS image, in a file of the size this app was packed with), its DLC copied out if it holds any, then the game started;
