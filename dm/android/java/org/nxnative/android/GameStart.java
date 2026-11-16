@@ -56,7 +56,7 @@ import org.json.JSONObject;
 public class GameStart extends Activity {
     static final String ROMFS = "RomFS.img", PREF_URI = "romfs_uri", SPV_ZIP = "spv.zip";
     static final int PICK = 1;
-    String id, name, dataUrl; long romfsBytes, dataBytes, dlcAt; File dir, ext;
+    String id, name, dataUrl; long romfsBytes, dataBytes, dlcAt, spvAt, spvBytes; File dir, ext;
     TextView status; TextView choose;
 
     @Override protected void onCreate(Bundle b) {
@@ -66,6 +66,7 @@ public class GameStart extends Activity {
         catch (Exception e) { fail("This app holds no game (assets/game/game.json): " + e); return; }
         id = g.optString("title_id").toUpperCase(Locale.ROOT); name = g.optString("name", id); romfsBytes = g.optLong("romfs_bytes", -1);
         dataBytes = g.optLong("data_bytes", romfsBytes); dlcAt = g.optLong("dlc_at", 0);
+        spvAt = g.optLong("spv_at", 0); spvBytes = g.optLong("spv_bytes", 0);   // shaders the APK couldn't hold, in the game data after the RomFS (Kaoz625 blz/data-download)
         dataUrl = g.optString("data_url", ""); if (dataUrl.isEmpty()) dataUrl = null;
         ext = getExternalFilesDir(null); if (ext == null) ext = getFilesDir();
         dir = new File(ext, "games/" + id);
@@ -226,10 +227,11 @@ public class GameStart extends Activity {
             if (got != 8 || !new String(h, StandardCharsets.US_ASCII).equals("DMROMFS1")) { p.close(); return "That file (" + what + ") isn't " + name + "'s game data."; }
             if (dataBytes > 0 && size != dataBytes) { p.close(); return String.format(Locale.ROOT, "That file (%s) is %s, but %s's game data is %s: it's another version, or not copied completely.", what, gb(size), name, gb(dataBytes)); }
             final long len = romfsBytes > 0 ? romfsBytes : size;
-            if (dlcAt <= 0) { start(p.detachFd(), 0, len); return null; }
+            if (dlcAt <= 0 && spvAt <= 0) { start(p.detachFd(), 0, len); return null; }
             new Thread(new Runnable() { public void run() {
-                String why;
-                try { why = dlc(p.getFileDescriptor()); } catch (Exception e) { why = "Couldn't copy " + name + "'s DLC out of its game data: " + e.getMessage(); }
+                String why = null;
+                if (dlcAt > 0) try { why = dlc(p.getFileDescriptor()); } catch (Exception e) { why = "Couldn't copy " + name + "'s DLC out of its game data: " + e.getMessage(); }
+                if (why == null && spvAt > 0) try { why = spv(p.getFileDescriptor()); } catch (Exception e) { why = "Couldn't unpack " + name + "'s shaders out of its game data: " + e.getMessage(); }
                 if (why != null) {
                     try { p.close(); } catch (IOException e) { /* closing */ }
                     say(why); ui(new Runnable() { public void run() { choose.setVisibility(View.VISIBLE); } }); return;
@@ -292,6 +294,27 @@ public class GameStart extends Activity {
             }
             if (!part.renameTo(new File(aoc, idx[i] + ".img"))) throw new IOException("can't name " + part);
         }
+        try (OutputStream o = new FileOutputStream(stamp)) { o.write(mark.getBytes(StandardCharsets.UTF_8)); }
+        return null;
+    }
+
+    // The shaders' spv.zip at spvAt in the game data → games/<title ID>/spv/, once: spv/.pack holds this data's mark. unpack() empties spv/ after an app update, so it runs again then
+    String spv(final FileDescriptor fd) throws Exception {
+        if (spvAt + spvBytes > dataBytes) return "The shaders in the game data can't be read: they lie outside it.";
+        File out = new File(dir, "spv"), stamp = new File(out, ".pack"); String mark = dataBytes + ":" + spvAt + ":" + spvBytes;
+        if (mark.equals(readFile(stamp))) return null;
+        rm(out); out.mkdirs();
+        if (out.getUsableSpace() < spvBytes + (256L << 20)) return String.format(Locale.ROOT, "There isn't room on this device to unpack %s's shaders (%s).", name, gb(spvBytes));
+        InputStream in = new InputStream() {   // the ZIP's bytes, read where they lie in the game data
+            long pos = spvAt, left = spvBytes;
+            @Override public int read() throws IOException { byte[] b = new byte[1]; return read(b, 0, 1) <= 0 ? -1 : (b[0] & 0xff); }
+            @Override public int read(byte[] b, int o, int n) throws IOException {
+                if (left <= 0) return -1;
+                try { int k = Os.pread(fd, b, o, (int) Math.min(n, left), pos); if (k <= 0) throw new IOException("the game data ends early"); pos += k; left -= k; return k; }
+                catch (android.system.ErrnoException e) { throw new IOException(e); }
+            }
+        };
+        unzip(new java.io.BufferedInputStream(in, 4 << 20), out, new byte[1 << 20], new Count() { public void at(int k) { say(String.format(Locale.ROOT, "Preparing %s for its first start… %d shaders", name, k)); } });
         try (OutputStream o = new FileOutputStream(stamp)) { o.write(mark.getBytes(StandardCharsets.UTF_8)); }
         return null;
     }

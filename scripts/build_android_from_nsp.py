@@ -609,15 +609,19 @@ def dlc_pack(images):   # → the pack's header and its records [(index, offset 
     return DLC_MAGIC + struct.pack('<II', len(recs), 0) + b''.join(struct.pack('<IIQQ', i, 0, o, n) for i, o, n in recs), recs, end
 
 
-def write_data(dst, rom, images):   # the data file beside a game app: the RomFS (an APFS clone where the volume makes one, never a hard link: the DLC is appended), then the DLC pack
+def write_data(dst, rom, images, spv_zip=None, spv_at=0):   # the data file beside a game app: the RomFS (an APFS clone where the volume makes one, never a hard link: the DLC is appended), then the DLC pack, then the shaders' spv.zip at spv_at when the APK can't hold them (Kaoz625 blz/data-download)
     rom_bytes = Path(rom).stat().st_size; at = -(-rom_bytes // DLC_ALIGN) * DLC_ALIGN
     head, recs, _ = dlc_pack(images); Path(dst).unlink(missing_ok=True)
     if not (sys.platform == 'darwin' and subprocess.run(['cp', '-c', str(rom), str(dst)], capture_output=True).returncode == 0): shutil.copyfile(rom, dst)
     with open(dst, 'r+b') as f:
-        f.truncate(at); f.seek(at); f.write(head)
-        for (i, p), (_, off, size) in zip(images, recs):
-            f.seek(at + off)
-            with open(p, 'rb') as src: shutil.copyfileobj(src, f, 16 << 20)
+        if images:
+            f.truncate(at); f.seek(at); f.write(head)
+            for (i, p), (_, off, size) in zip(images, recs):
+                f.seek(at + off)
+                with open(p, 'rb') as src: shutil.copyfileobj(src, f, 16 << 20)
+        if spv_zip:
+            f.truncate(spv_at); f.seek(spv_at)
+            with open(spv_zip, 'rb') as src: shutil.copyfileobj(src, f, 16 << 20)
     return at
 
 
@@ -650,12 +654,19 @@ def make_game_app(sdk, g, game, patched, spv, font, aoc, defaults, so, meta, wor
     for f, n in staged:
         k = {'code': 'code', SPV_ZIP: 'shaders', 'font': 'font'}.get(f.split('/')[0], 'the rest'); parts[k] += n; files[k] += 1
     rom_bytes = Path(str(rom)).stat().st_size; dlc_walk = walk(aoc); dlc = sum(n for _, n in dlc_walk)
+    spv_out = None   # Kaoz625 blz/data-download: shaders past the APK's 2 GiB (Ocarina of Time's 6.1 GiB) go into the data file after the RomFS (and DLC); GameStart unzips them out at the first start
+    if beside and not xapk and sum(parts.values()) >= game_app_limit() and (stage / SPV_ZIP).is_file():
+        spv_out = work / SPV_ZIP; spv_out.unlink(missing_ok=True); shutil.move(str(stage / SPV_ZIP), str(spv_out))
+        say(f'the shaders ({gib(parts["shaders"])}) go into the data file after the RomFS: the APK can\'t hold them; the app unzips them at its first start')
+        parts['shaders'] = 0; files['shaders'] = 0
     inside, dlc_inside = game_app_plan(parts, dlc, rom_bytes, xapk, game_app_limit(), files, len(dlc_walk), beside=beside)
     if dlc_inside and dlc: stage_link(stage / 'aoc', Path(aoc).resolve())
     out_images = dlc_images(aoc) if dlc and not dlc_inside else []
     dlc_at = -(-rom_bytes // DLC_ALIGN) * DLC_ALIGN if out_images else 0
     data_bytes = (dlc_at + dlc_pack(out_images)[2]) if out_images else rom_bytes
-    info = {**meta, 'package': pkg, 'data_bytes': data_bytes, **({'dlc_at': dlc_at} if dlc_at else {})}
+    spv_at = -(-data_bytes // DLC_ALIGN) * DLC_ALIGN if spv_out else 0
+    if spv_out: data_bytes = spv_at + spv_out.stat().st_size
+    info = {**meta, 'package': pkg, 'data_bytes': data_bytes, **({'dlc_at': dlc_at} if dlc_at else {}), **({'spv_at': spv_at, 'spv_bytes': spv_out.stat().st_size} if spv_out else {})}
     (stage / 'game.json').write_text(json.dumps(info, indent=1), encoding='utf-8', newline='\n')
     files = sorted(Path(r, f).relative_to(stage).as_posix() for r, _, fs in os.walk(stage, followlinks=True) for f in fs)
     (stage / 'files.txt').write_text(''.join(f + '\n' for f in files + ['files.txt']), encoding='utf-8', newline='\n')
@@ -697,7 +708,7 @@ def make_game_app(sdk, g, game, patched, spv, font, aoc, defaults, so, meta, wor
         made = [apk]; romfs = out_dir / f'{base}.romfs'
         if inside: romfs.unlink(missing_ok=True)
         else:
-            if out_images: write_data(romfs, rom, out_images)
+            if out_images or spv_out: write_data(romfs, rom, out_images, spv_out, spv_at)
             else: clone(str(rom), romfs)
             made.append(romfs)
     if out_images: say(f'the DLC ({len(out_images)} image{"s" * (len(out_images) != 1)}, {gib(dlc)}) is in {made[-1].name} after the RomFS: the APK can\'t hold it; the app copies it out at its first start')
