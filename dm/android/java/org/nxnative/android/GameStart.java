@@ -74,6 +74,11 @@ public class GameStart extends Activity {
         new Thread(new Runnable() { public void run() { prepare(); } }, "unpack").start();
     }
 
+    // The translated shaders' folder: the app's private internal storage, not Android/data. A game has tens of thousands of them in one folder (Super Smash Bros.
+    // Ultimate 92,221), and on shared storage each new file there costs more the fuller the folder is: Smash's first start had unpacked 26,000 in 20 minutes and
+    // was slowing (Android 17 emulator, 16 Nov 2026), while the same folder on internal storage takes them at thousands a second. The host is told with DM_SPV_DIR
+    File spvDir() { return new File(getFilesDir(), "spv"); }
+
     // ---------------- the game's files ----------------
     void prepare() {
         try {
@@ -91,13 +96,14 @@ public class GameStart extends Activity {
         // the packer's list of the files (a lookup per entry would ask the APK's index once for each of tens of thousands of shaders); a walk without one
         try { for (String l : new String(readAsset("game/files.txt"), StandardCharsets.UTF_8).split("\n")) if (!l.isEmpty()) files.add("game/" + l); }
         catch (java.io.FileNotFoundException none) { list(am, "game", files); }
-        for (String top : new String[] {"code", "spv", "font", "aoc"}) rm(new File(dir, top));
+        for (String top : new String[] {"code", "spv", "font", "aoc"}) rm(new File(dir, top));   // spv here: an older build's shaders on shared storage
+        rm(spvDir());
         dir.mkdirs(); byte[] buf = new byte[1 << 16]; int n = 0;
         for (String f : files) {
             if (++n % 200 == 1 || n == files.size()) say(String.format(Locale.ROOT, "Preparing %s for its first start… %d of %d files", name, n, files.size()));
             if (f.equals("game/" + SPV_ZIP)) {   // the shaders: one entry, many files
                 try (InputStream in = am.open(f, AssetManager.ACCESS_STREAMING)) {
-                    unzip(in, new File(dir, "spv"), buf, new Count() { public void at(int k) { say(String.format(Locale.ROOT, "Preparing %s for its first start… %d shaders", name, k)); } });
+                    unzip(in, spvDir(), buf, new Count() { public void at(int k) { say(String.format(Locale.ROOT, "Preparing %s for its first start… %d shaders", name, k)); } });
                 }
                 continue;
             }
@@ -183,9 +189,12 @@ public class GameStart extends Activity {
             for (int attempt = 0; attempt < 30; attempt++) {
                 try {
                     long have = part.length();
-                    if (dataBytes > 0 && ext.getUsableSpace() < dataBytes - have + (200L << 20)) {
+                    // the data still to come, and the shaders unpacked out of it afterwards (Smash: 21.6 GB + 3.9 GB; asking for the data alone let a
+                    // device with 24 GB free download all of it and then fail at the shaders)
+                    long need = dataBytes - have + (200L << 20) + (spvAt > 0 && !new File(spvDir(), ".pack").isFile() ? spvBytes + (256L << 20) : 0);
+                    if (dataBytes > 0 && ext.getUsableSpace() < need) {
                         why = String.format(Locale.ROOT, "%s needs %s of free space for its game data, and this device has %s free. Free some space, then open the game again.",
-                                name, gb(dataBytes - have + (200L << 20)), gb(ext.getUsableSpace()));
+                                name, gb(need), gb(ext.getUsableSpace()));
                         break;
                     }
                     if (dataBytes > 0 && have >= dataBytes) break;
@@ -298,10 +307,10 @@ public class GameStart extends Activity {
         return null;
     }
 
-    // The shaders' spv.zip at spvAt in the game data → games/<title ID>/spv/, once: spv/.pack holds this data's mark. unpack() empties spv/ after an app update, so it runs again then
+    // The shaders' spv.zip at spvAt in the game data → spvDir() (internal storage), once: its .pack holds this data's mark. unpack() empties spv/ after an app update, so it runs again then
     String spv(final FileDescriptor fd) throws Exception {
         if (spvAt + spvBytes > dataBytes) return "The shaders in the game data can't be read: they lie outside it.";
-        File out = new File(dir, "spv"), stamp = new File(out, ".pack"); String mark = dataBytes + ":" + spvAt + ":" + spvBytes;
+        File out = spvDir(), stamp = new File(out, ".pack"); String mark = dataBytes + ":" + spvAt + ":" + spvBytes;
         if (mark.equals(readFile(stamp))) return null;
         rm(out); out.mkdirs();
         if (out.getUsableSpace() < spvBytes + (256L << 20)) return String.format(Locale.ROOT, "There isn't room on this device to unpack %s's shaders (%s).", name, gb(spvBytes));
@@ -331,6 +340,7 @@ public class GameStart extends Activity {
 
     void start(int fd, long off, long len) throws Exception {
         Os.setenv("DM_ROMFS", "fd:" + fd + ":" + off + ":" + len, true);
+        Os.setenv("DM_SPV_DIR", spvDir().getPath(), true);
         String d = readFile(new File(dir, "defaults.txt"));
         if (d != null) for (String line : d.split("\n")) {
             int eq = line.indexOf('='); if (line.startsWith("#") || eq <= 0) continue;
